@@ -690,7 +690,7 @@ function readProfile(values) {
 function renderOnboarding(app) {
   const values = { sex: '', job: 'sitzend', goal: '' };
   app.innerHTML = `
-    <div class="logo" style="margin-top:20px">BILANZ</div>
+    <div class="logo" style="margin-top:20px">KALOR</div>
     <p class="muted" style="margin-top:4px">Training rein, Essen rein, fertig. Erst kurz zu dir.</p>
     <div class="step">1 · KÖRPERDATEN</div>
     <div class="card" style="margin-top:8px">${profileFields(values)}</div>
@@ -712,7 +712,7 @@ function renderOnboarding(app) {
     const c = calc();
     db.profile = null; // erst nach Bestätigung speichern
     app.innerHTML = `
-      <div class="logo" style="margin-top:20px">BILANZ</div>
+      <div class="logo" style="margin-top:20px">KALOR</div>
       <div class="step">3 · DEIN TAGESZIEL</div>
       <div class="card target-box" style="margin-top:8px">
         <div class="big">${fmt(c.target)}</div>
@@ -825,9 +825,9 @@ async function exportData() {
     photos: await photoDb.all(),
   };
   const blob = new Blob([JSON.stringify(data)], { type: 'application/json' });
-  const file = new File([blob], `bilanz-${dayKey()}.json`, { type: 'application/json' });
+  const file = new File([blob], `kalor-${dayKey()}.json`, { type: 'application/json' });
   if (navigator.canShare?.({ files: [file] })) {
-    try { await navigator.share({ files: [file], title: 'Bilanz-Sicherung' }); return; } catch { /* abgebrochen → Download */ }
+    try { await navigator.share({ files: [file], title: 'Kalor-Sicherung' }); return; } catch { /* abgebrochen → Download */ }
   }
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
@@ -842,7 +842,7 @@ async function importData(ev) {
   if (!file) return;
   try {
     const data = JSON.parse(await file.text());
-    if (data.app !== 'bilanz') throw new Error('Keine Bilanz-Sicherung.');
+    if (data.app !== 'bilanz') throw new Error('Keine Kalor-Sicherung.');
     if (!confirm('Aktuelle Daten durch die Sicherung ersetzen?')) return;
     db.profile = data.profile;
     db.entries = data.entries || [];

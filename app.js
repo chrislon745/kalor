@@ -642,11 +642,12 @@ function renderOnboarding(app) {
     <div class="step">2 · GEMINI-SCHLÜSSEL</div>
     <div class="card" style="margin-top:8px">
       <p class="small muted" style="margin-top:0">Kostenlos unter <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">aistudio.google.com/apikey</a> → „API-Schlüssel erstellen“ → kopieren. Geht auch später unter Profil.</p>
-      <input id="p-key" placeholder="AIza…" autocomplete="off">
+      ${keyField('p-key', '')}
     </div>
     <button class="btn primary" id="ob-next" style="margin-top:18px">Weiter</button>
     <div id="ob-out"></div>`;
   bindSegs(app, values);
+  $('#p-key-paste').onclick = () => pasteInto($('#p-key'));
   $('#ob-next').onclick = () => {
     let p;
     try { p = readProfile(values); } catch (err) { return toast(err.message); }
@@ -677,6 +678,25 @@ function renderOnboarding(app) {
   };
 }
 
+function keyField(id, value) {
+  return `<div class="row">
+      <input id="${id}" value="${esc(value)}" placeholder="Schlüssel einfügen" autocomplete="off" autocapitalize="off" spellcheck="false">
+      <button type="button" class="btn ghost" id="${id}-paste" style="width:auto;padding:13px 14px">Einfügen</button>
+    </div>`;
+}
+
+async function pasteInto(input) {
+  try {
+    const text = (await navigator.clipboard.readText()).trim();
+    if (!text) { toast('Zwischenablage ist leer – Schlüssel erst in AI Studio kopieren.'); return false; }
+    input.value = text;
+    return true;
+  } catch {
+    toast('Kein Zugriff auf die Zwischenablage. Bitte beim Nachfragen „Zulassen“ tippen.');
+    return false;
+  }
+}
+
 function renderSettings(app) {
   const p = db.profile;
   const values = { sex: p.sex, job: p.job, goal: p.goal };
@@ -692,7 +712,7 @@ function renderSettings(app) {
     <h2>Gemini</h2>
     <div class="card">
       <label class="f"><span>API-Schlüssel (<a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">kostenlos holen</a>)</span>
-        <input id="s-key" value="${esc(db.settings.apiKey)}" placeholder="AIza…" autocomplete="off"></label>
+        ${keyField('s-key', db.settings.apiKey)}</label>
       <label class="f"><span>Modell</span><input id="s-model" value="${esc(db.settings.model)}"></label>
       <button class="btn ghost" id="s-key-save">Speichern</button>
     </div>
@@ -721,6 +741,9 @@ function renderSettings(app) {
     db.save();
     toast(`Gespeichert – Tagesziel ${fmt(calc().target)} kcal`);
     render();
+  };
+  $('#s-key-paste').onclick = async () => {
+    if (await pasteInto($('#s-key'))) $('#s-key-save').click();
   };
   $('#s-key-save').onclick = () => {
     db.settings.apiKey = $('#s-key').value.trim();

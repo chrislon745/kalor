@@ -1,5 +1,5 @@
 // App-Shell offline verfügbar machen. API-Aufrufe (Gemini, Open Food Facts) gehen immer ins Netz.
-const CACHE = 'bilanz-v1';
+const CACHE = 'bilanz-v2';
 const SHELL = ['./', 'index.html', 'style.css', 'app.js', 'manifest.webmanifest', 'icons/icon-192.png', 'icons/icon-512.png'];
 
 self.addEventListener('install', e => {

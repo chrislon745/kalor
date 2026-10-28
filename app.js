@@ -206,14 +206,25 @@ function estimateFood({ text, image }) {
 }
 
 function estimateTraining(text) {
+  const c = calc();
   const prompt =
     'Du bist Sportwissenschaftler. Schätze den Energieverbrauch einer Trainingseinheit so genau wie möglich. ' +
-    `Person: ${bodyInfo()}. Training: "${text}". ` +
-    'Nutze MET-Werte (Compendium of Physical Activities) und das Körpergewicht, berücksichtige Intensität, Pausen und Dauer. ' +
-    'Ist keine Dauer genannt, nimm eine realistische an und nenne sie. ' +
-    'Gib den NETTO-Mehrverbrauch an, also ohne den Grundumsatz, der in dieser Zeit ohnehin angefallen wäre. ' +
-    'Antworte nur als JSON: {"name": "kurzer deutscher Name", "minutes": Zahl, "kcal": Zahl, ' +
-    '"details": "knappe Begründung in einem Satz"}';
+    `Person: ${bodyInfo()}. Grundumsatz: ${c.bmr} kcal/Tag (= ${(c.bmr / 1440).toFixed(2)} kcal/Min). ` +
+    `Training: "${text}". ` +
+    'Vorgehen: ' +
+    '1) Zerlege das Training in Abschnitte und nutze JEDE Angabe der Person (Dauer, Tempo, Steigung, Puls, Schritte, Gewichte, Pausen, Gefühl). ' +
+    '2) Ist ein Puls genannt, berechne den Bruttoverbrauch dieses Abschnitts mit der Keytel-Formel ' +
+    '(Mann: kcal/Min = (-55.0969 + 0.6309*Puls + 0.1988*kg + 0.2017*Alter) / 4.184; ' +
+    'Frau: kcal/Min = (-20.4022 + 0.4472*Puls - 0.1263*kg + 0.074*Alter) / 4.184) und prüfe das Ergebnis gegen MET-Werte. ' +
+    '3) Ohne Puls nutze MET-Werte (Compendium of Physical Activities) mit dem Körpergewicht. ' +
+    '4) Sind Schritte genannt, rechne die Schrittfrequenz (Schritte pro Minute) aus und nutze sie als Maß für Tempo und Intensität ' +
+    '(z. B. beim Stairmaster: Stufen pro Minute; beim Gehen/Laufen: Kadenz). ' +
+    '5) Ist keine Dauer genannt, nimm eine realistische an und nenne sie. ' +
+    '6) Ziehe vom Bruttoverbrauch den Grundumsatz für die Trainingsdauer ab: Gib den NETTO-Mehrverbrauch an. ' +
+    'Antworte nur als JSON: {"name": "kurzer deutscher Name", "minutes": Gesamtminuten als Zahl, "kcal": Netto-kcal als Zahl, ' +
+    '"details": "Rechenweg knapp, pro Abschnitt eine kurze Angabe", ' +
+    '"used": "welche Angaben der Person eingeflossen sind, z. B. Puls 125, 1000 Schritte in 35 Min (≈ 29/Min)", ' +
+    '"ignored": "Angaben, die nicht verwertbar waren, sonst leerer String"}';
   return gemini([{ text: prompt }]);
 }
 
@@ -375,6 +386,8 @@ function resultForm(el, r, type) {
           : `<label class="f"><span>Minuten</span><input id="r-min" type="number" inputmode="numeric" value="${round(r.minutes)}"></label>`}
       </div>
       ${r.details ? `<div class="details">${esc(r.details)}</div>` : ''}
+      ${r.used ? `<div class="details"><span style="color:var(--accent)">✓ Berücksichtigt:</span> ${esc(r.used)}</div>` : ''}
+      ${r.ignored ? `<div class="details"><span style="color:var(--danger)">✗ Nicht verwertet:</span> ${esc(r.ignored)}</div>` : ''}
       <button class="btn primary" id="r-save">Eintragen</button>
       ${type === 'food' ? `<button class="btn ghost" id="r-fav" style="margin-top:8px">☆ Eintragen + als Favorit</button>` : ''}
     </div>`;

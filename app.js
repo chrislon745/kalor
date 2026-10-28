@@ -124,19 +124,61 @@ function dayTotals(key) {
 
 // ---------- Gemini ----------
 
+const FALLBACK_MODEL = 'gemini-flash-lite-latest';
+const GEMINI_TIMEOUT_MS = 30000;
+
+// Probiert erst das eingestellte Modell, bei Zeitüberschreitung/Überlastung das schnellere Lite-Modell.
 async function gemini(parts) {
   const { apiKey, model } = db.settings;
   if (!apiKey) throw new Error('Kein Gemini-Schlüssel hinterlegt. Trag ihn unter Profil ein.');
-  const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
-    body: JSON.stringify({
-      contents: [{ role: 'user', parts }],
-      generationConfig: { responseMimeType: 'application/json', temperature: 0.2 },
-    }),
-  });
+  let lastErr;
+  for (const m of [...new Set([model, FALLBACK_MODEL])]) {
+    try {
+      return await callGemini(m, apiKey, parts, true);
+    } catch (err) {
+      lastErr = err;
+      if (!err.retry) throw err;
+    }
+  }
+  throw lastErr;
+}
+
+async function callGemini(model, apiKey, parts, thinking) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), GEMINI_TIMEOUT_MS);
+  let res;
+  try {
+    res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
+      method: 'POST',
+      signal: ctrl.signal,
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+      body: JSON.stringify({
+        contents: [{ role: 'user', parts }],
+        generationConfig: {
+          responseMimeType: 'application/json',
+          temperature: 0.2,
+          // Wenig Nachdenken = schnelle Antwort
+          ...(thinking ? { thinkingConfig: { thinkingLevel: 'low' } } : {}),
+        },
+      }),
+    });
+  } catch (err) {
+    throw Object.assign(new Error(err.name === 'AbortError'
+      ? 'Gemini antwortet gerade nicht. Bitte gleich nochmal versuchen.'
+      : 'Keine Verbindung zu Gemini. Prüf dein Internet und versuch es nochmal.'), { retry: true });
+  } finally {
+    clearTimeout(timer);
+  }
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error?.message || 'Gemini-Fehler ' + res.status);
+  if (!res.ok) {
+    const msg = data.error?.message || '';
+    // Ältere Modelle kennen thinkingLevel nicht → ohne nochmal
+    if (thinking && res.status === 400 && /thinking/i.test(msg)) return callGemini(model, apiKey, parts, false);
+    if ((data.error?.details || []).some(d => d.reason === 'ACCESS_TOKEN_TYPE_UNSUPPORTED')) {
+      throw new Error('Google lehnt diesen Schlüssel ab. Erstell in AI Studio einen neuen Schlüssel und füg ihn unter Profil ein.');
+    }
+    throw Object.assign(new Error(msg || 'Gemini-Fehler ' + res.status), { retry: res.status === 429 || res.status >= 500 });
+  }
   const text = (data.candidates?.[0]?.content?.parts || []).map(p => p.text || '').join('');
   try {
     return JSON.parse(text.replace(/^```(json)?|```$/g, '').trim());

@@ -352,9 +352,12 @@ function dictate(textarea, btn) {
   recognition = new SR();
   recognition.lang = 'de-DE';
   recognition.interimResults = true;
-  recognition.continuous = true;
+  // Android-Chrome liefert im Dauer-Modus jeden Zwischenstand erneut als eigenes Ergebnis
+  // (→ "500 500 g 500 g …"). Ein Satz pro Aufnahme; nochmal tippen hängt weiteren Text an.
+  recognition.continuous = false;
   recognition.onresult = ev => {
-    textarea.value = start + [...ev.results].map(r => r[0].transcript).join(' ');
+    const last = ev.results[ev.results.length - 1];
+    textarea.value = start + last[0].transcript.trim();
   };
   recognition.onerror = ev => { if (ev.error !== 'aborted') toast('Spracheingabe: ' + ev.error); };
   recognition.onend = () => stopDictation();

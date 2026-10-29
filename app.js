@@ -284,7 +284,7 @@ function renderToday(app) {
 
     <div class="actions">
       <button class="btn primary big" id="add-food"><span class="ico">📷</span>Essen</button>
-      <button class="btn big" id="add-training"><span class="ico">🎙</span>Training</button>
+      <button class="btn big" id="add-training"><span class="ico">🏋️</span>Training</button>
     </div>
 
     ${t.list.length ? `<h2>Einträge</h2><div class="card">${t.list

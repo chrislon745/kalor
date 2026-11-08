@@ -125,27 +125,121 @@ function dayTotals(key) {
 // ---------- Gemini ----------
 
 const FALLBACK_MODEL = 'gemini-flash-lite-latest';
-const GEMINI_TIMEOUT_MS = 30000;
+const GEMINI_TIMEOUT_TEXT_MS = 25000;
+const GEMINI_TIMEOUT_IMAGE_MS = 45000;
+const GEMINI_MAX_ATTEMPTS = 3;          // pro Modell
+const GEMINI_TOTAL_BUDGET_MS = 60000;   // danach endgültig aufgeben
+const GEMINI_MIN_GAP_MS = 4000;         // Free Tier: ca. 10–15 Anfragen pro Minute
+const GEMINI_MAX_RETRY_DELAY_MS = 20000;
 
-// Probiert erst das eingestellte Modell, bei Zeitüberschreitung/Überlastung das schnellere Lite-Modell.
-async function gemini(parts) {
-  const { apiKey, model } = db.settings;
-  if (!apiKey) throw new Error('Kein Gemini-Schlüssel hinterlegt. Trag ihn unter Profil ein.');
-  let lastErr;
-  for (const m of [...new Set([model, FALLBACK_MODEL])]) {
-    try {
-      return await callGemini(m, apiKey, parts, true);
-    } catch (err) {
-      lastErr = err;
-      if (!err.retry) throw err;
-    }
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+class GeminiError extends Error {
+  constructor(message, { kind = 'unknown', status = 0, retry = false, retryAfterMs = null, short = '' } = {}) {
+    super(message);
+    Object.assign(this, { kind, status, retry, retryAfterMs, short: short || message });
   }
-  throw lastErr;
 }
 
-async function callGemini(model, apiKey, parts, thinking) {
+// Fehlerprotokoll (nur auf dem Gerät; ohne Schlüssel und ohne Eingaben)
+const errorLog = {
+  all() { return store.get('errlog', []); },
+  add(entry) { store.set('errlog', [{ time: new Date().toISOString(), ...entry }, ...this.all()].slice(0, 50)); },
+  clear() { store.set('errlog', []); },
+};
+
+const FOOD_SCHEMA = {
+  type: 'OBJECT',
+  properties: {
+    name: { type: 'STRING', description: 'kurzer deutscher Name' },
+    kcal: { type: 'NUMBER', description: 'Kalorien gesamt' },
+    protein: { type: 'NUMBER', description: 'Eiweiß in Gramm' },
+    details: { type: 'STRING', description: 'knappe Aufschlüsselung in einem Satz' },
+  },
+  required: ['name', 'kcal', 'protein', 'details'],
+  propertyOrdering: ['name', 'kcal', 'protein', 'details'],
+};
+
+const TRAINING_SCHEMA = {
+  type: 'OBJECT',
+  properties: {
+    name: { type: 'STRING', description: 'kurzer deutscher Name' },
+    minutes: { type: 'NUMBER', description: 'Gesamtminuten' },
+    kcal: { type: 'NUMBER', description: 'Netto-Mehrverbrauch in kcal' },
+    details: { type: 'STRING', description: 'Rechenweg knapp, pro Abschnitt eine Angabe' },
+    used: { type: 'STRING', description: 'eingeflossene Angaben der Person' },
+    ignored: { type: 'STRING', description: 'nicht verwertbare Angaben, sonst leer' },
+  },
+  required: ['name', 'minutes', 'kcal', 'details', 'used', 'ignored'],
+  propertyOrdering: ['name', 'minutes', 'kcal', 'details', 'used', 'ignored'],
+};
+
+// Eine Anfrage nach der anderen, mit Mindestabstand – schont das Free-Tier-Limit.
+let geminiQueue = Promise.resolve();
+let lastGeminiRequest = 0;
+
+function gemini(parts, opts = {}) {
+  const { apiKey, model } = db.settings;
+  if (!apiKey) return Promise.reject(new GeminiError('Kein Gemini-Schlüssel hinterlegt. Trag ihn unter Profil ein.', { kind: 'auth' }));
+  const job = geminiQueue.then(() => runGemini(apiKey, model, parts, opts));
+  geminiQueue = job.catch(() => {});
+  return job;
+}
+
+async function runGemini(apiKey, model, parts, { schema, validate = x => x, timeoutMs = GEMINI_TIMEOUT_TEXT_MS, onStatus = () => {} }) {
+  const started = Date.now();
+  const models = [...new Set([model, FALLBACK_MODEL])];
+  let lastErr;
+  for (const m of models) {
+    if (m !== models[0]) onStatus('Versuche schnelleres Ersatzmodell …');
+    for (let attempt = 1; attempt <= GEMINI_MAX_ATTEMPTS; attempt++) {
+      const wait = lastGeminiRequest + GEMINI_MIN_GAP_MS - Date.now();
+      if (wait > 0) await sleep(wait);
+      lastGeminiRequest = Date.now();
+      const t0 = Date.now();
+      try {
+        return validate(await callGemini(m, apiKey, parts, { schema, timeoutMs }));
+      } catch (err) {
+        const e = err instanceof GeminiError ? err : new GeminiError(err.message || String(err), { kind: 'unknown' });
+        lastErr = e;
+        errorLog.add({ model: m, attempt, status: e.status, kind: e.kind, ms: Date.now() - t0, msg: String(e.message).slice(0, 200) });
+        if (!e.retry) throw e;
+        if (e.kind === 'quota_day' || e.kind === 'model') break; // dieses Modell hilft heute nicht mehr
+        const delay = Math.min(e.retryAfterMs ?? backoffMs(attempt), GEMINI_MAX_RETRY_DELAY_MS);
+        if (attempt === GEMINI_MAX_ATTEMPTS || Date.now() - started + delay > GEMINI_TOTAL_BUDGET_MS) break;
+        const until = Date.now() + delay;
+        while (Date.now() < until) {
+          onStatus(`${e.short} – neuer Versuch in ${Math.ceil((until - Date.now()) / 1000)} s (${attempt + 1}/${GEMINI_MAX_ATTEMPTS})`);
+          await sleep(Math.min(1000, until - Date.now()));
+        }
+        onStatus(`Neuer Versuch (${attempt + 1}/${GEMINI_MAX_ATTEMPTS}) …`);
+      }
+    }
+    if (Date.now() - started > GEMINI_TOTAL_BUDGET_MS) break;
+  }
+  throw finalError(lastErr);
+}
+
+// 1 s, 2 s, 4 s … plus etwas Zufall, damit Wiederholungen nicht im Gleichschritt kommen
+function backoffMs(attempt) {
+  return 1000 * 2 ** (attempt - 1) + Math.random() * 500;
+}
+
+function finalError(e) {
+  const texts = {
+    rate: 'Gemini ist gerade ausgelastet (Limit der kostenlosen Stufe). Warte etwa eine Minute und versuch es nochmal.',
+    quota_day: 'Das Tageslimit der kostenlosen Gemini-Stufe ist erreicht. Morgen geht es wieder – bis dahin Werte manuell eintragen.',
+    server: 'Gemini ist gerade überlastet. Versuch es in ein paar Minuten nochmal.',
+    timeout: 'Gemini hat zu lange gebraucht. Versuch es nochmal – bei Fotos hilft oft ein zweiter Anlauf.',
+    network: 'Keine Verbindung zu Gemini. Prüf dein Internet und versuch es nochmal.',
+    parse: 'Gemini hat keine brauchbare Antwort geliefert. Versuch es nochmal oder formulier es etwas genauer.',
+  };
+  return new GeminiError(texts[e.kind] || e.message, { kind: e.kind, status: e.status, retry: e.retry });
+}
+
+async function callGemini(model, apiKey, parts, { schema, timeoutMs, thinking = true }) {
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), GEMINI_TIMEOUT_MS);
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   let res;
   try {
     res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
@@ -156,6 +250,7 @@ async function callGemini(model, apiKey, parts, thinking) {
         contents: [{ role: 'user', parts }],
         generationConfig: {
           responseMimeType: 'application/json',
+          ...(schema ? { responseSchema: schema } : {}),
           temperature: 0.2,
           // Wenig Nachdenken = schnelle Antwort
           ...(thinking ? { thinkingConfig: { thinkingLevel: 'low' } } : {}),
@@ -163,28 +258,88 @@ async function callGemini(model, apiKey, parts, thinking) {
       }),
     });
   } catch (err) {
-    throw Object.assign(new Error(err.name === 'AbortError'
-      ? 'Gemini antwortet gerade nicht. Bitte gleich nochmal versuchen.'
-      : 'Keine Verbindung zu Gemini. Prüf dein Internet und versuch es nochmal.'), { retry: true });
+    throw err.name === 'AbortError'
+      ? new GeminiError('Zeitüberschreitung', { kind: 'timeout', retry: true, short: 'Gemini antwortet nicht' })
+      : new GeminiError('Netzwerkfehler: ' + err.message, { kind: 'network', retry: true, short: 'Keine Verbindung' });
   } finally {
     clearTimeout(timer);
   }
+
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
-    const msg = data.error?.message || '';
-    // Ältere Modelle kennen thinkingLevel nicht → ohne nochmal
-    if (thinking && res.status === 400 && /thinking/i.test(msg)) return callGemini(model, apiKey, parts, false);
-    if ((data.error?.details || []).some(d => d.reason === 'ACCESS_TOKEN_TYPE_UNSUPPORTED')) {
-      throw new Error('Google lehnt diesen Schlüssel ab. Erstell in AI Studio einen neuen Schlüssel und füg ihn unter Profil ein.');
+    const msg = data.error?.message || 'HTTP ' + res.status;
+    const details = data.error?.details || [];
+    // Ältere Modelle kennen thinkingLevel bzw. das Schema nicht → ohne nochmal
+    if (res.status === 400 && thinking && /thinking/i.test(msg)) return callGemini(model, apiKey, parts, { schema, timeoutMs, thinking: false });
+    if (res.status === 400 && schema && /schema/i.test(msg)) return callGemini(model, apiKey, parts, { schema: null, timeoutMs, thinking });
+    if (res.status === 401 || res.status === 403 || details.some(d => /API_KEY|ACCESS_TOKEN/.test(d.reason || ''))) {
+      throw new GeminiError('Google lehnt deinen Gemini-Schlüssel ab. Prüf ihn unter Profil oder erstell in AI Studio einen neuen.', { kind: 'auth', status: res.status });
     }
-    throw Object.assign(new Error(msg || 'Gemini-Fehler ' + res.status), { retry: res.status === 429 || res.status >= 500 });
+    if (res.status === 429) {
+      const retryInfo = details.find(d => /RetryInfo/.test(d['@type'] || ''));
+      const secs = parseFloat(retryInfo?.retryDelay);
+      const perDay = details.some(d => (d.violations || []).some(v => /PerDay/i.test(v.quotaId || '')));
+      throw new GeminiError(msg, {
+        kind: perDay ? 'quota_day' : 'rate', status: 429, retry: true,
+        retryAfterMs: Number.isFinite(secs) ? secs * 1000 + 300 : null, short: 'Gemini ist ausgelastet',
+      });
+    }
+    if (res.status === 404) throw new GeminiError(msg, { kind: 'model', status: 404, retry: true, short: 'Modell nicht gefunden' });
+    if (res.status >= 500) throw new GeminiError(msg, { kind: 'server', status: res.status, retry: true, short: 'Gemini ist überlastet' });
+    throw new GeminiError('Gemini hat die Anfrage abgelehnt: ' + msg, { kind: 'request', status: res.status });
   }
-  const text = (data.candidates?.[0]?.content?.parts || []).map(p => p.text || '').join('');
-  try {
-    return JSON.parse(text.replace(/^```(json)?|```$/g, '').trim());
-  } catch {
-    throw new Error('Antwort nicht lesbar. Bitte nochmal versuchen.');
+
+  const cand = data.candidates?.[0];
+  if (!cand) {
+    throw new GeminiError('Gemini hat die Anfrage abgelehnt' + (data.promptFeedback?.blockReason ? ` (${data.promptFeedback.blockReason})` : '') + '.', { kind: 'blocked', status: 200 });
   }
+  if (cand.finishReason === 'SAFETY') throw new GeminiError('Gemini hat die Antwort aus Sicherheitsgründen blockiert.', { kind: 'blocked', status: 200 });
+  const text = (cand.content?.parts || []).filter(p => !p.thought).map(p => p.text || '').join('');
+  const obj = parseJsonLoose(text);
+  if (!obj) throw new GeminiError('Antwort ist kein gültiges JSON: ' + text.slice(0, 80), { kind: 'parse', status: 200, retry: true, short: 'Antwort unlesbar' });
+  return obj;
+}
+
+// JSON auch dann lesen, wenn Markdown oder Text drumherum steht
+function parseJsonLoose(text) {
+  const t = String(text || '').replace(/```(?:json)?/gi, '').trim();
+  try { return JSON.parse(t); } catch { /* weiter unten */ }
+  const start = t.indexOf('{'), end = t.lastIndexOf('}');
+  if (start < 0 || end <= start) return null;
+  try { return JSON.parse(t.slice(start, end + 1)); } catch { return null; }
+}
+
+function toNum(v, min, max) {
+  const n = typeof v === 'number' ? v : parseFloat(String(v ?? '').replace(',', '.'));
+  return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : null;
+}
+
+function invalid(what) {
+  return new GeminiError(`Antwort ohne gültige Angabe: ${what}`, { kind: 'parse', status: 200, retry: true, short: 'Antwort unvollständig' });
+}
+
+function validateFood(r) {
+  const kcal = toNum(r.kcal, 0, 5000);
+  if (kcal === null) throw invalid('kcal');
+  return {
+    name: String(r.name || '').trim() || 'Essen',
+    kcal,
+    protein: toNum(r.protein, 0, 400) ?? 0,
+    details: String(r.details || '').trim(),
+  };
+}
+
+function validateTraining(r) {
+  const kcal = toNum(r.kcal, 0, 5000);
+  if (kcal === null) throw invalid('kcal');
+  return {
+    name: String(r.name || '').trim() || 'Training',
+    minutes: toNum(r.minutes, 0, 900) ?? 0,
+    kcal,
+    details: String(r.details || '').trim(),
+    used: String(r.used || '').trim(),
+    ignored: String(r.ignored || '').trim(),
+  };
 }
 
 function bodyInfo() {
@@ -192,20 +347,25 @@ function bodyInfo() {
   return `${p.sex === 'm' ? 'Mann' : 'Frau'}, ${p.age} Jahre, ${p.height} cm, ${currentWeight()} kg`;
 }
 
-function estimateFood({ text, image }) {
+function estimateFood({ text, image, onStatus }) {
   const prompt =
     'Du bist Ernährungsexperte. Schätze Kalorien und Eiweiß möglichst genau. ' +
     'Nutze typische Portionsgrößen in Deutschland, wenn keine Menge genannt ist. ' +
     (image ? 'Auf dem Foto ist eine Mahlzeit. Schätze die Portion anhand von Tellergröße und Besteck. ' : '') +
     (text ? `Beschreibung: "${text}". ` : '') +
-    'Antworte nur als JSON: {"name": "kurzer deutscher Name", "kcal": Zahl, "protein": Gramm als Zahl, ' +
-    '"details": "knappe Aufschlüsselung in einem Satz"}';
+    'Antworte als JSON mit name (kurzer deutscher Name), kcal (Zahl), protein (Gramm als Zahl) ' +
+    'und details (knappe Aufschlüsselung in einem Satz).';
   const parts = [{ text: prompt }];
   if (image) parts.push({ inline_data: { mime_type: 'image/jpeg', data: image } });
-  return gemini(parts);
+  return gemini(parts, {
+    schema: FOOD_SCHEMA,
+    validate: validateFood,
+    timeoutMs: image ? GEMINI_TIMEOUT_IMAGE_MS : GEMINI_TIMEOUT_TEXT_MS,
+    onStatus,
+  });
 }
 
-function estimateTraining(text) {
+function estimateTraining(text, onStatus) {
   const c = calc();
   const prompt =
     'Du bist Sportwissenschaftler. Schätze den Energieverbrauch einer Trainingseinheit so genau wie möglich. ' +
@@ -221,11 +381,11 @@ function estimateTraining(text) {
     '(z. B. beim Stairmaster: Stufen pro Minute; beim Gehen/Laufen: Kadenz). ' +
     '5) Ist keine Dauer genannt, nimm eine realistische an und nenne sie. ' +
     '6) Ziehe vom Bruttoverbrauch den Grundumsatz für die Trainingsdauer ab: Gib den NETTO-Mehrverbrauch an. ' +
-    'Antworte nur als JSON: {"name": "kurzer deutscher Name", "minutes": Gesamtminuten als Zahl, "kcal": Netto-kcal als Zahl, ' +
-    '"details": "Rechenweg knapp, pro Abschnitt eine kurze Angabe", ' +
-    '"used": "welche Angaben der Person eingeflossen sind, z. B. Puls 125, 1000 Schritte in 35 Min (≈ 29/Min)", ' +
-    '"ignored": "Angaben, die nicht verwertbar waren, sonst leerer String"}';
-  return gemini([{ text: prompt }]);
+    'Antworte als JSON mit name (kurzer deutscher Name), minutes (Gesamtminuten), kcal (Netto-kcal), ' +
+    'details (Rechenweg knapp, pro Abschnitt eine kurze Angabe), ' +
+    'used (welche Angaben der Person eingeflossen sind, z. B. Puls 125, 1000 Schritte in 35 Min (≈ 29/Min)) ' +
+    'und ignored (Angaben, die nicht verwertbar waren, sonst leerer String).';
+  return gemini([{ text: prompt }], { schema: TRAINING_SCHEMA, validate: validateTraining, onStatus });
 }
 
 
@@ -369,12 +529,35 @@ function sheetHead(title) {
   return `<div class="sheet-title"><h2>${title}</h2><button class="x" data-close aria-label="Schließen">×</button></div>`;
 }
 
+// Zeigt einen Spinner; die zurückgegebene Funktion aktualisiert den Statustext
 function loading(el, msg) {
-  el.innerHTML = `<div class="result center"><div class="spinner"></div><p class="small muted">${msg}</p></div>`;
+  el.innerHTML = `<div class="result center"><div class="spinner"></div><p class="small muted">${esc(msg)}</p></div>`;
+  const p = $('p', el);
+  return text => { if (p.isConnected) p.textContent = text; };
 }
 
-function showError(el, err) {
-  el.innerHTML = `<div class="result" style="border-color:var(--danger)"><p style="margin:0">${esc(err.message || err)}</p></div>`;
+// Fehlermeldung, optional mit „Nochmal versuchen“
+function showError(el, err, retry) {
+  const canRetry = retry && !['auth', 'blocked'].includes(err.kind);
+  el.innerHTML = `
+    <div class="result" style="border-color:var(--danger)">
+      <p style="margin:0">${esc(err.message || err)}</p>
+      ${canRetry ? '<button class="btn ghost" data-retry style="margin-top:12px">Nochmal versuchen</button>' : ''}
+    </div>`;
+  if (canRetry) $('[data-retry]', el).onclick = retry;
+}
+
+// Gemini-Anfrage mit Spinner, Status, Fehleranzeige und gesperrten Knöpfen
+async function runEstimate(out, buttons, msg, estimate, type) {
+  buttons.forEach(b => { b.disabled = true; });
+  const status = loading(out, msg);
+  try {
+    resultForm(out, await estimate(status), type);
+  } catch (err) {
+    showError(out, err, () => runEstimate(out, buttons, msg, estimate, type));
+  } finally {
+    buttons.forEach(b => { b.disabled = false; });
+  }
 }
 
 // Ergebnis-Karte mit editierbaren Werten
@@ -421,7 +604,8 @@ function openFood() {
   openSheet(`
     ${sheetHead('Essen')}
     <div class="tools">
-      <button id="f-photo"><span class="ico">📷</span>Foto</button>
+      <button id="f-cam"><span class="ico">📷</span>Kamera</button>
+      <button id="f-gallery"><span class="ico">🖼</span>Galerie</button>
       <button id="f-scan"><span class="ico">▥</span>Barcode</button>
       <button id="f-manual"><span class="ico">✎</span>Manuell</button>
     </div>
@@ -435,25 +619,33 @@ function openFood() {
     <div id="f-out"></div>
   `);
   const out = $('#f-out');
+  const buttons = ['#f-go', '#f-cam', '#f-gallery'].map(s => $(s));
   $('#f-mic').onclick = e => dictate($('#f-text'), e.currentTarget);
-  $('#f-go').onclick = async () => {
+  $('#f-go').onclick = () => {
     const text = $('#f-text').value.trim();
     if (!text) return toast('Beschreib kurz, was du gegessen hast.');
     stopDictation();
-    loading(out, 'Gemini schätzt …');
-    try { resultForm(out, await estimateFood({ text }), 'food'); } catch (err) { showError(out, err); }
+    runEstimate(out, buttons, 'Gemini schätzt …', onStatus => estimateFood({ text, onStatus }), 'food');
   };
-  $('#f-photo').onclick = () => $('#file-food').click();
-  $('#file-food').onchange = async ev => {
+  // Kamera und Galerie laufen über denselben Analyse-Ablauf
+  const onPhoto = async ev => {
     const file = ev.target.files[0];
     ev.target.value = '';
     if (!file) return;
-    loading(out, 'Foto wird analysiert …');
+    stopDictation();
+    let image;
     try {
-      const image = await toJpegBase64(file, 1024);
-      resultForm(out, await estimateFood({ text: $('#f-text').value.trim(), image }), 'food');
-    } catch (err) { showError(out, err); }
+      image = await toJpegBase64(file, 1024);
+    } catch (err) {
+      return showError(out, err);
+    }
+    const text = $('#f-text').value.trim();
+    runEstimate(out, buttons, 'Foto wird analysiert …', onStatus => estimateFood({ text, image, onStatus }), 'food');
   };
+  $('#f-cam').onclick = () => $('#file-food').click();
+  $('#f-gallery').onclick = () => $('#file-food-gallery').click();
+  $('#file-food').onchange = onPhoto;
+  $('#file-food-gallery').onchange = onPhoto;
   $('#f-manual').onclick = () => resultForm(out, { name: '', kcal: '', protein: '' }, 'food');
   $('#f-scan').onclick = () => startScan(out);
   $$('[data-fav]').forEach(b => b.onclick = () => {
@@ -462,79 +654,226 @@ function openFood() {
   });
 }
 
-async function toJpegBase64(file, max) {
-  const img = await createImageBitmap(file);
-  const scale = Math.min(1, max / Math.max(img.width, img.height));
-  const c = document.createElement('canvas');
-  c.width = round(img.width * scale);
-  c.height = round(img.height * scale);
-  c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
-  return c.toDataURL('image/jpeg', 0.82).split(',')[1];
+const IMAGE_MAX_BYTES = 400 * 1024;
+
+async function decodeImage(file) {
+  try {
+    return await createImageBitmap(file, { imageOrientation: 'from-image' });
+  } catch { /* Rückfall über <img> */ }
+  const url = URL.createObjectURL(file);
+  try {
+    const img = new Image();
+    img.src = url;
+    await img.decode();
+    return img;
+  } catch {
+    throw new Error('Dieses Bildformat kann nicht gelesen werden (z. B. HEIC). Nimm ein Kamerafoto oder speichere das Bild als JPG.');
+  } finally {
+    URL.revokeObjectURL(url);
+  }
 }
 
+// Verkleinert auf max. Kantenlänge und senkt die JPEG-Qualität, bis das Bild klein genug ist
+async function toJpegBase64(file, max, maxBytes = IMAGE_MAX_BYTES) {
+  const img = await decodeImage(file);
+  const w = img.naturalWidth || img.width, h = img.naturalHeight || img.height;
+  const scale = Math.min(1, max / Math.max(w, h));
+  const c = document.createElement('canvas');
+  c.width = round(w * scale);
+  c.height = round(h * scale);
+  c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+  img.close?.();
+  let data;
+  for (const q of [0.82, 0.72, 0.62, 0.52, 0.42]) {
+    data = c.toDataURL('image/jpeg', q).split(',')[1];
+    if (data.length * 0.75 <= maxBytes) break;
+  }
+  return data;
+}
+
+// ---------- Barcode ----------
+
+const SCAN_FORMATS = ['ean_13', 'ean_8', 'upc_a', 'upc_e'];
+const SCAN_INTERVAL_MS = 125;             // ca. 8 Prüfungen pro Sekunde
+const SCAN_HINT_AFTER_MS = 15000;
+// Ersatz-Erkennung (ZXing), wenn das Gerät selbst keine Barcodes erkennt – z. B. iPhone
+const BARCODE_POLYFILL_URL = 'https://cdn.jsdelivr.net/npm/barcode-detector@3.2.2/ponyfill/+esm';
+
+let scanTimer = null;
+
 function stopScan() {
+  clearTimeout(scanTimer);
+  scanTimer = null;
   if (scanStream) { scanStream.getTracks().forEach(t => t.stop()); scanStream = null; }
 }
 
+async function getBarcodeDetector() {
+  if ('BarcodeDetector' in window) {
+    try {
+      const supported = await BarcodeDetector.getSupportedFormats();
+      const formats = SCAN_FORMATS.filter(f => supported.includes(f));
+      if (formats.length) return new BarcodeDetector({ formats });
+    } catch { /* Ersatz laden */ }
+  }
+  const mod = await import(BARCODE_POLYFILL_URL);
+  return new mod.BarcodeDetector({ formats: SCAN_FORMATS });
+}
+
+// Prüfziffer von EAN-8/EAN-13/UPC-A – verhindert Fehllesungen
+function validGtin(code) {
+  if (!/^\d{8}$|^\d{12,14}$/.test(code)) return false;
+  const digits = code.split('').map(Number);
+  const check = digits.pop();
+  const sum = digits.reverse().reduce((s, d, i) => s + d * (i % 2 === 0 ? 3 : 1), 0);
+  return (10 - (sum % 10)) % 10 === check;
+}
+
+function cameraErrorText(err) {
+  switch (err.name) {
+    case 'NotAllowedError': return 'Kamerazugriff verweigert. Erlaube die Kamera für diese Seite (Chrome: Schloss-Symbol → Berechtigungen) und versuch es nochmal.';
+    case 'NotFoundError': return 'Keine Kamera gefunden.';
+    case 'NotReadableError': return 'Die Kamera wird gerade von einer anderen App benutzt.';
+    case 'OverconstrainedError': return 'Die Kamera unterstützt die Einstellungen nicht.';
+    default: return 'Kamera konnte nicht gestartet werden (' + (err.message || err.name) + ').';
+  }
+}
+
 async function startScan(out) {
+  stopScan();
   out.innerHTML = `
     <div class="result">
-      <video class="scan" id="scan-video" playsinline muted></video>
-      <div class="row" style="margin-top:10px">
+      <div class="scan-wrap">
+        <video class="scan" id="scan-video" playsinline muted></video>
+        <div class="scan-frame"></div>
+      </div>
+      <p class="small muted center" id="scan-status" style="margin:10px 0">Kamera wird gestartet …</p>
+      <div class="row">
         <input id="scan-code" inputmode="numeric" placeholder="oder Barcode-Nummer eingeben">
         <button class="btn ghost" id="scan-go" style="width:auto;padding:13px 16px">OK</button>
       </div>
     </div>`;
-  $('#scan-go').onclick = () => { const c = $('#scan-code').value.trim(); if (c) { stopScan(); lookupBarcode(c, out); } };
+  const status = text => { const el = $('#scan-status'); if (el) el.textContent = text; };
+  $('#scan-go').onclick = () => {
+    const c = $('#scan-code').value.replace(/\D/g, '');
+    if (!c) return toast('Barcode-Nummer eingeben.');
+    stopScan();
+    lookupBarcode(c, out);
+  };
 
-  if (!('BarcodeDetector' in window)) { toast('Kamera-Scan hier nicht verfügbar – Nummer eintippen.'); return; }
-  try {
-    scanStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
-  } catch {
-    toast('Kein Kamerazugriff – Nummer eintippen.');
-    return;
+  if (!navigator.mediaDevices?.getUserMedia) {
+    return status('Kamera hier nicht verfügbar – öffne Kalor in Chrome oder tipp die Nummer ein.');
   }
+
+  // Erkennung parallel zur Kamera vorbereiten
+  const detectorPromise = getBarcodeDetector().catch(err => err);
+
+  try {
+    scanStream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } },
+      audio: false,
+    });
+  } catch (err) {
+    return status(cameraErrorText(err));
+  }
+  // Dauer-Autofokus, wo die Kamera ihn anbietet
+  const track = scanStream.getVideoTracks()[0];
+  try {
+    if (track.getCapabilities?.().focusMode?.includes('continuous')) {
+      await track.applyConstraints({ advanced: [{ focusMode: 'continuous' }] });
+    }
+  } catch { /* ohne Autofokus weiter */ }
+
   const video = $('#scan-video');
+  if (!video) return stopScan(); // Fenster wurde inzwischen geschlossen
   video.srcObject = scanStream;
-  await video.play();
-  const detector = new BarcodeDetector({ formats: ['ean_13', 'ean_8', 'upc_a', 'upc_e'] });
-  const loop = async () => {
+  try {
+    await video.play();
+  } catch (err) {
+    stopScan();
+    return status('Kamerabild konnte nicht gestartet werden (' + err.message + '). Tipp die Nummer ein.');
+  }
+
+  const detector = await detectorPromise;
+  if (!scanStream) return;
+  if (detector instanceof Error) {
+    stopScan();
+    return status('Barcode-Erkennung konnte nicht geladen werden (Internet?). Tipp die Nummer ein.');
+  }
+
+  status('Barcode in den Rahmen halten …');
+  const started = Date.now();
+  let lastCode = null;
+  const tick = async () => {
     if (!scanStream) return;
     try {
-      const codes = await detector.detect(video);
-      if (codes.length) {
-        stopScan();
-        navigator.vibrate?.(60);
-        return lookupBarcode(codes[0].rawValue, out);
+      if (video.readyState >= 2) {
+        const codes = await detector.detect(video);
+        const code = codes.map(c => c.rawValue).find(validGtin);
+        if (code && code === lastCode) {
+          stopScan();
+          navigator.vibrate?.(60);
+          status('Erkannt: ' + code);
+          return lookupBarcode(code, out);
+        }
+        lastCode = code || null;
       }
-    } catch { /* nächster Frame */ }
-    requestAnimationFrame(loop);
+    } catch { /* nächster Versuch */ }
+    if (Date.now() - started > SCAN_HINT_AFTER_MS) status('Noch nichts erkannt – näher ran, für gutes Licht sorgen oder Nummer eintippen.');
+    scanTimer = setTimeout(tick, SCAN_INTERVAL_MS);
   };
-  loop();
+  tick();
+}
+
+function barcodeFallback(out, code, message, name) {
+  out.innerHTML = `
+    <div class="result" style="border-color:var(--danger)">
+      <p style="margin:0 0 12px">${esc(message)}</p>
+      <div class="grid2">
+        <button class="btn ghost" id="bc-photo">📷 Per Foto schätzen</button>
+        <button class="btn ghost" id="bc-manual">✎ Manuell eintragen</button>
+      </div>
+      <button class="btn ghost" id="bc-again" style="margin-top:8px">▥ Nochmal scannen</button>
+    </div>`;
+  $('#bc-photo').onclick = () => $('#file-food').click();
+  $('#bc-manual').onclick = () => resultForm(out, { name: name || 'Produkt ' + code, kcal: '', protein: '' }, 'food');
+  $('#bc-again').onclick = () => startScan(out);
 }
 
 async function lookupBarcode(code, out) {
-  loading(out, 'Produkt wird gesucht …');
+  loading(out, 'Produkt ' + code + ' wird gesucht …');
+  let data;
   try {
-    const res = await fetch(`https://world.openfoodfacts.org/api/v2/product/${encodeURIComponent(code)}.json?fields=product_name,product_name_de,brands,nutriments,serving_quantity`);
-    const data = await res.json();
-    const p = data.product;
-    const kcal100 = p?.nutriments?.['energy-kcal_100g'];
-    if (!p || kcal100 == null) throw new Error('Produkt nicht gefunden. Beschreib es per Text oder Foto.');
-    const name = [p.brands?.split(',')[0], p.product_name_de || p.product_name].filter(Boolean).join(' – ') || 'Produkt ' + code;
-    const prot100 = p.nutriments.proteins_100g || 0;
-    out.innerHTML = `
-      <div class="result">
-        <div class="name" style="font-weight:600">${esc(name)}</div>
-        <div class="details">${fmt(kcal100)} kcal · ${fmt(prot100)} g Eiweiß pro 100 g</div>
-        <label class="f"><span>Menge (g / ml)</span><input id="bc-g" type="number" inputmode="numeric" value="${round(p.serving_quantity) || 100}"></label>
-        <button class="btn primary" id="bc-ok">Weiter</button>
-      </div>`;
-    $('#bc-ok').onclick = () => {
-      const g = +$('#bc-g').value || 0;
-      resultForm(out, { name: `${name} (${g} g)`, kcal: kcal100 * g / 100, protein: prot100 * g / 100 }, 'food');
-    };
-  } catch (err) { showError(out, err); }
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 12000);
+    const res = await fetch(`https://world.openfoodfacts.org/api/v2/product/${encodeURIComponent(code)}.json` +
+      '?fields=product_name,product_name_de,brands,nutriments,serving_quantity', { signal: ctrl.signal });
+    clearTimeout(timer);
+    data = res.status === 404 ? {} : await res.json();
+  } catch {
+    return showError(out, new Error('Open Food Facts ist gerade nicht erreichbar. Prüf dein Internet.'), () => lookupBarcode(code, out));
+  }
+  const p = data.product;
+  if (!p) return barcodeFallback(out, code, `Produkt ${code} ist nicht in Open Food Facts.`);
+
+  const name = [p.brands?.split(',')[0], p.product_name_de || p.product_name].filter(Boolean).join(' – ') || 'Produkt ' + code;
+  const n = p.nutriments || {};
+  // Manche Produkte haben nur Kilojoule – dann umrechnen
+  const kj = n['energy-kj_100g'] ?? n.energy_100g;
+  const kcal100 = n['energy-kcal_100g'] ?? (kj != null ? kj / 4.184 : null);
+  if (kcal100 == null) return barcodeFallback(out, code, `„${name}“ gefunden, aber ohne Nährwerte.`, name);
+
+  const prot100 = n.proteins_100g || 0;
+  out.innerHTML = `
+    <div class="result">
+      <div class="name" style="font-weight:600">${esc(name)}</div>
+      <div class="details">${fmt(kcal100)} kcal · ${fmt(prot100)} g Eiweiß pro 100 g</div>
+      <label class="f"><span>Menge (g / ml)</span><input id="bc-g" type="number" inputmode="numeric" value="${round(p.serving_quantity) || 100}"></label>
+      <button class="btn primary" id="bc-ok">Weiter</button>
+    </div>`;
+  $('#bc-ok').onclick = () => {
+    const g = +$('#bc-g').value || 0;
+    resultForm(out, { name: `${name} (${g} g)`, kcal: kcal100 * g / 100, protein: prot100 * g / 100 }, 'food');
+  };
 }
 
 
@@ -555,12 +894,11 @@ function openTraining() {
   `);
   const out = $('#t-out');
   $('#t-mic').onclick = e => dictate($('#t-text'), e.currentTarget);
-  $('#t-go').onclick = async () => {
+  $('#t-go').onclick = () => {
     const text = $('#t-text').value.trim();
     if (!text) return toast('Beschreib kurz dein Training.');
     stopDictation();
-    loading(out, 'Gemini rechnet mit deinen Körperdaten …');
-    try { resultForm(out, await estimateTraining(text), 'training'); } catch (err) { showError(out, err); }
+    runEstimate(out, [$('#t-go')], 'Gemini rechnet mit deinen Körperdaten …', onStatus => estimateTraining(text, onStatus), 'training');
   };
   $$('[data-recent]').forEach(b => b.onclick = () => resultForm(out, recent[+b.dataset.recent], 'training'));
 }
@@ -755,6 +1093,36 @@ async function pasteInto(input) {
   }
 }
 
+const KIND_LABELS = {
+  rate: 'Limit (429)', quota_day: 'Tageslimit', server: 'Server', timeout: 'Zeitüberschreitung', network: 'Netzwerk',
+  parse: 'Antwort unlesbar', auth: 'Schlüssel', blocked: 'Blockiert', model: 'Modell', request: 'Anfrage', unknown: 'Unbekannt',
+};
+
+function diagnoseLine(e) {
+  const t = new Date(e.time).toLocaleString('de-DE', { timeZone: TZ, day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  return `${t} · ${e.model} · Versuch ${e.attempt} · ${KIND_LABELS[e.kind] || e.kind}${e.status ? ' ' + e.status : ''} · ${(e.ms / 1000).toFixed(1)} s`;
+}
+
+function diagnoseText() {
+  return errorLog.all().map(e => diagnoseLine(e) + '\n  ' + e.msg).join('\n');
+}
+
+function diagnoseHtml() {
+  const log = errorLog.all();
+  if (!log.length) return '<p class="small muted" style="margin:0">Keine Gemini-Fehler protokolliert.</p>';
+  return `
+    <p class="small muted" style="margin-top:0">Letzte ${log.length} Gemini-Fehler (nur auf diesem Handy, ohne Schlüssel und Eingaben).</p>
+    ${log.slice(0, 10).map(e => `
+      <div class="small" style="padding:8px 0;border-bottom:1px solid var(--line)">
+        <div>${esc(diagnoseLine(e))}</div>
+        <div class="muted" style="word-break:break-word">${esc(e.msg)}</div>
+      </div>`).join('')}
+    <div class="grid2" style="margin-top:12px">
+      <button class="btn ghost" id="d-copy">Kopieren</button>
+      <button class="btn ghost" id="d-clear">Leeren</button>
+    </div>`;
+}
+
 function renderSettings(app) {
   const p = db.profile;
   const values = { sex: p.sex, job: p.job, goal: p.goal };
@@ -774,6 +1142,9 @@ function renderSettings(app) {
       <label class="f"><span>Modell</span><input id="s-model" value="${esc(db.settings.model)}"></label>
       <button class="btn ghost" id="s-key-save">Speichern</button>
     </div>
+
+    <h2>Diagnose</h2>
+    <div class="card">${diagnoseHtml()}</div>
 
     <h2>Daten</h2>
     <div class="card">
@@ -810,6 +1181,13 @@ function renderSettings(app) {
     toast('Gespeichert');
   };
   $('#s-export').onclick = exportData;
+  if ($('#d-copy')) {
+    $('#d-copy').onclick = async () => {
+      try { await navigator.clipboard.writeText(diagnoseText()); toast('Protokoll kopiert'); }
+      catch { toast('Kopieren nicht möglich – mach stattdessen einen Screenshot.'); }
+    };
+    $('#d-clear').onclick = () => { errorLog.clear(); render(); };
+  }
   $('#s-import').onclick = () => $('#file-import').click();
   $('#file-import').onchange = importData;
   $('#s-reset').onclick = async () => {
